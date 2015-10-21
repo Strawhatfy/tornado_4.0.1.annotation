@@ -476,6 +476,10 @@ class HTTPServerConnectionDelegate(object):
             request/response exchange.
 
         This method should return a `.HTTPMessageDelegate`.
+
+        server_conn: 这个参数的类型在定义时是不确定的（an opaque object），仅指定表现
+        为“持久化连接”。具体的类型在 `HTTPServerConnectionDelegate` 的具体实现类中
+        确定。有点类似于标记接口的味道。
         """
         raise NotImplementedError()
 

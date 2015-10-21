@@ -1076,6 +1076,7 @@ class IOStream(BaseIOStream):
                 return None
             else:
                 raise
+        # remote peer 断开连接后会收到一个 0 byte 的读事件。通过这个检测可以认为对方已经断开连接。
         if not chunk:
             self.close()
             return None

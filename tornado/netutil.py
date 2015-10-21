@@ -98,10 +98,26 @@ def bind_sockets(port, address=None, family=socket.AF_UNSPEC,
         # automatically exclude those results from getaddrinfo
         # results.
         # http://bugs.python.org/issue16208
+        #
+        # 由于可以通过指定编译选项来编译出仅支持 ipv4 的 python 版本，为了保证
+        # getaddrinfo 也只返回 ipv4 的地址，所以这里指定 socket.AF_INET
         family = socket.AF_INET
+
+    # 函数注释中已经有说明了，flag 是一个传递给 getaddrinfo 函数的 AI_* 掩码。常用的如
+    # ``socket.AI_PASSIVE | socket.AI_CANNONAME | socket.AI_NUMERICHOST``。
+    # ``socket.AI_PASSIVE``: 指示函数返回的地址将用于 bind() 函数调用，否则用于 connect() 函数调用；
+    # ``socket.AI_CANNONAME``: 指示函数返回的地址需要一个规范名(而不是别名)。
+    # ``socket.AI_NUMERICHOST``: 指示函数返回数字格式的地址。
     if flags is None:
         flags = socket.AI_PASSIVE
     bound_port = None
+
+    # socket.getaddrinfo(host, port[, family[, socktype[, proto[, flags]]]])
+    # family: 协议簇，常用的协议包括 AF_UNIX(1，本机通信)/AF_INET(2，IPV4)/AF_INET6(10，IPV6)。
+    # socktype：socket 的类型，常见的socket类型包括SOCK_STREAM(TCP流)/SOCK_DGRAM(UDP数据报)/SOCK_RAW(原始套接字)。
+    #           其中，SOCK_STREAM=1，SOCK_DGRAM=2，SOCK_RAW=3。
+    # proto：协议，套接口所用的协议。如调用者不想指定，可用0。常用的协议有，IPPROTO_TCP(=6) 和
+    #        IPPTOTO_UDP(=17)，它们分别对应 TCP 传输协议、UDP 传输协议。与 IP 数据包的 ``8位协议字段`` 对应。
     for res in set(socket.getaddrinfo(address, port, family, socket.SOCK_STREAM,
                                       0, flags)):
         af, socktype, proto, canonname, sockaddr = res
@@ -113,6 +129,14 @@ def bind_sockets(port, address=None, family=socket.AF_UNSPEC,
             # prompt for access (often repeatedly, due to an apparent
             # bug in its ability to remember granting access to an
             # application). Skip these addresses.
+            #
+            # address = 'localhost' 时 Mac OS X 可能会返回一个 ipv6 地址 fe80::1%lo0，
+            # 而防火墙不能识别出这是一个本地地址而尝试访问会导致 bug ，所以这里忽略这个地址。
+            # ipv6  二进制 128 位，以 16 位为一组，每组以 `:` 分开，`::` 表示一组0或者多组连续的0，
+            # 但是只能出现 1 次。
+            # sockaddr is a tuple describing a socket address, whose format
+            # depends on the returned family (a (address, port) 2-tuple for
+            # AF_INET, a (address, port, flow info, scope id) 4-tuple for AF_INET6)
             continue
         try:
             sock = socket.socket(af, socktype, proto)
@@ -120,8 +144,11 @@ def bind_sockets(port, address=None, family=socket.AF_UNSPEC,
             if errno_from_exception(e) == errno.EAFNOSUPPORT:
                 continue
             raise
+        # 为 fd 设置 FD_CLOEXEC 标识
         set_close_exec(sock.fileno())
         if os.name != 'nt':
+            # 避免在服务器重启的时候发生“该地址以被使用”这种错误。
+            # socket.SOL_SOCKET 指定在套接字级别设置 `可选项`。
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if af == socket.AF_INET6:
             # On linux, ipv6 sockets accept ipv4 too by default,

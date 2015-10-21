@@ -164,14 +164,20 @@ class HTTPServer(TCPServer, httputil.HTTPServerConnectionDelegate):
             yield conn.close()
 
     def handle_stream(self, stream, address):
+        # 请求的上下文，以属性字段的形式封装请求关联的数据
         context = _HTTPRequestContext(stream, address,
                                       self.protocol)
+        # 支持 HTTP/1.x 的服务端持久化的连接对象， 作为 HTTPServerConnectionDelegate.start_request
+        # 方法的 server_conn 实参。
         conn = HTTP1ServerConnection(
             stream, self.conn_params, context)
         self._connections.add(conn)
         conn.start_serving(self)
 
     def start_request(self, server_conn, request_conn):
+        # request_callback 可能是以 `HTTPServerRequest` 对象作为参数的函数，也
+        # 可能是一个 `HTTPServerConnectionDelegate` 实例。`_ServerRequestAdapter` 需
+        # 要正确处理这两种类型的对象，以适配 `HTTPServerConnectionDelegate`。
         return _ServerRequestAdapter(self, request_conn)
 
     def on_close(self, server_conn):
@@ -218,6 +224,24 @@ class _HTTPRequestContext(object):
 
     def _apply_xheaders(self, headers):
         """Rewrite the ``remote_ip`` and ``protocol`` fields."""
+        # 1. X-Forwarded-For: 记录一个请求从客户端出发到目标服务器过程中经历的代理或
+        # 者负载平衡设备的IP。最早由 Squid 的开发人员引入，现已成为事实上的标准被广泛使用。
+        # 一般格式为: client1, proxy1, proxy2，其中的值通过一个 “逗号+空格” 把多
+        # 个 IP 地址分开，最左边(client1)是最原始客户端的IP地址, 代理服务器每成功收到
+        # 一个请求，就把请求来源 IP 地址添加到右边(所以最后一个代理的 IP 不在该字段中，但
+        # 可以通过 socket.getpeername() 获取，这个 Ip 是可靠的，伪造 Ip 的是无法通过
+        #  TCP 三次握手的)。
+        #
+        # 2. X-Real-Ip：不是标准的 Http 头，不过 Nginx 在使用。通常被 HTTP 代理用来
+        # 表示与它产生 TCP 连接的设备 IP，这个设备可能是其他代理，也可能是真正的请求端。
+        #
+        # 3. 经过 Nginx 的 Http 请求，X-Forwarded-For 的最后一个 Ip 与 X-Real-Ip
+        # 是相同的，记录的是直接与 Nginx 建立连接的端 Ip。
+        #
+        # 4. 安全问题：伪造 X-Forwarded-For 字段很容易，所以使用该字段信息时要格外注意。
+        # 通常 X-Forwarded-For 是最后一个IP地址是最后一个代理服务器的IP地址,这通常是一
+        # 个比较可靠的信息来源。
+        #
         # Squid uses X-Forwarded-For, others use X-Real-Ip
         ip = headers.get("X-Forwarded-For", self.remote_ip)
         ip = ip.split(',')[-1].strip()
@@ -249,6 +273,8 @@ class _ServerRequestAdapter(httputil.HTTPMessageDelegate):
         self.server = server
         self.connection = connection
         self.request = None
+        # 如果 server.request_callback 是一个 HTTPServerConnectionDelegate 实例，
+        # 比如 tornado.web.Application 实例，那就委托给它处理请求，否则就自己处理。
         if isinstance(server.request_callback,
                       httputil.HTTPServerConnectionDelegate):
             self.delegate = server.request_callback.start_request(connection)
@@ -258,9 +284,11 @@ class _ServerRequestAdapter(httputil.HTTPMessageDelegate):
             self._chunks = []
 
     def headers_received(self, start_line, headers):
+        # 对这次请求应用 xheaders 支持
         if self.server.xheaders:
             self.connection.context._apply_xheaders(headers)
         if self.delegate is None:
+            # 初始化一个 HTTPServerRequest 实例，HTTP 数据解析完成后将为该对象的 body 字段赋值。
             self.request = httputil.HTTPServerRequest(
                 connection=self.connection, start_line=start_line,
                 headers=headers)
@@ -275,6 +303,9 @@ class _ServerRequestAdapter(httputil.HTTPMessageDelegate):
 
     def finish(self):
         if self.delegate is None:
+            # 为 body 字段赋值，并解析成 key/value 的形式，对上传的文件也采用这种方式（value 的类型
+            # 为 HTTPFile，由于有 max_body_size 和 max_buffer_szie 的限制，这里倒是不用担心文件
+            # 过大的问题）。
             self.request.body = b''.join(self._chunks)
             self.request._parse_body()
             self.server.request_callback(self.request)
@@ -290,6 +321,7 @@ class _ServerRequestAdapter(httputil.HTTPMessageDelegate):
         self._cleanup()
 
     def _cleanup(self):
+        # 请求处理正常结束或者连接关闭时进行一些清理工作，如有必要取消对 xheaders 的支持。
         if self.server.xheaders:
             self.connection.context._unapply_xheaders()
 

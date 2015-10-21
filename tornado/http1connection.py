@@ -582,6 +582,8 @@ class _GzipMessageDelegate(httputil.HTTPMessageDelegate):
         self._decompressor = None
 
     def headers_received(self, start_line, headers):
+        # 若是 gzip 数据，则提供 GzipDecompressor 实例用于 body 的解压缩。
+        # 并删除 Content-Encoding 报文头，用 X-Consumed-Content-Encoding 来代替。
         if headers.get("Content-Encoding") == "gzip":
             self._decompressor = GzipDecompressor()
             # Downstream delegates will only see uncompressed data,
@@ -671,20 +673,32 @@ class HTTP1ServerConnection(object):
                                        self.params, self.context)
                 request_delegate = delegate.start_request(self, conn)
                 try:
+                    # 解析 HTTP 数据，解析的结果交由 request_delegate 处理。通常 request_delegate
+                    # 会将解析结果保存到 HTTPServerRequest 中，参见 _ServerRequestAdapter 实现。
                     ret = yield conn.read_response(request_delegate)
                 except (iostream.StreamClosedError,
                         iostream.UnsatisfiableReadError):
+                    # 这两种异常由底层 IOStream 引发，发生时 IOStream 会自动关闭（包括关联的 fd） 并 logged。
+                    # 若是其他异常，则需要调用 conn.close() 以关闭 IOStream。
                     return
                 except _QuietException:
                     # This exception was already logged.
+                    #
+                    # HTTP1Connection 中发生异常时由 _ExceptionLoggingContext 捕获并 logged（详细异常），
+                    # 然后 _ExceptionLoggingContext 抛出 _QuietException 异常。
                     conn.close()
                     return
                 except Exception:
                     gen_log.error("Uncaught exception", exc_info=True)
                     conn.close()
                     return
+                # 前面已经处理了所有的异常情况，接下来处理正常情况：若是 keep-alive 的持久连接模式，则继续在该连接上循环
+                # 处理下一个 HTTP 请求直到连接关闭，否则退出循环。
+                # 由 HTTP1Connection._read_message 的实现可知 HTTP1Connection.read_response 返回 False 则
+                # 表示持久连接（keep-alive，连接未关闭），返回 True 则表示非 keep-alive 连接（已关闭）则终止循环。
                 if not ret:
                     return
                 yield gen.moment
         finally:
+            # HTTPServer.on_close 方法仅将当前 HTTP1ServerConnection 从其内部连接列表中移除。
             delegate.on_close(self)

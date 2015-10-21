@@ -139,6 +139,10 @@ def fork_processes(num_processes, max_restarts=100):
         id = start_child(i)
         if id is not None:
             return id
+
+    # master 进程负责监控子进程，若子进程异常结束(due to a signal or non-zero exit status)，
+    # 则负责重启子进程。`num_restarts` 变量记录了累计重启的子进程数量，若该值大于 `max_restarts`,
+    # 则抛出运行时异常。
     num_restarts = 0
     while children:
         try:

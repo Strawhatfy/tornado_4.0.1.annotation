@@ -217,6 +217,7 @@ class Configurable(object):
         """
         raise NotImplementedError()
 
+
     @classmethod
     def configurable_default(cls):
         """Returns the implementation class to be used if none is configured."""
