@@ -513,12 +513,18 @@ def with_timeout(timeout, future, io_loop=None):
     # callers and B) concurrent futures can only be cancelled while they are
     # in the queue, so cancellation cannot reliably bound our waiting time.
     result = Future()
+    # 把 future 和 result 串联起来，future 完成时若 result 没有完成或者被取消，则将
+    # future 的结果拷贝给 result。至于为什么不是超时取消 future，而是新建一个 result，
+    # 前面注释有解释。
     chain_future(future, result)
     if io_loop is None:
         io_loop = IOLoop.current()
     timeout_handle = io_loop.add_timeout(
         timeout,
         lambda: result.set_exception(TimeoutError("Timeout")))
+    # Future 是由 IOLoop 来负责解析，完成时由 IOLoop 触发回调，故不需要重复加入 IOLoop。
+    # 而 concurrent.futures.Futures 则可能由其他线程来解析，所以需要将其加入到 IOLoop
+    # 中，以便在其完成时由 IOLoop 触发回调。
     if isinstance(future, Future):
         # We know this future will resolve on the IOLoop, so we don't
         # need the extra thread-safety of IOLoop.add_future (and we also

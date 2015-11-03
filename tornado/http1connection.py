@@ -152,6 +152,7 @@ class HTTP1Connection(httputil.HTTPConnection):
     def _read_message(self, delegate):
         need_delegate_close = False
         try:
+            # 消息头与消息体之间由一个空行分开
             header_future = self.stream.read_until_regex(
                 b"\r?\n\r?\n",
                 max_bytes=self.params.max_header_size)
@@ -166,7 +167,13 @@ class HTTP1Connection(httputil.HTTPConnection):
                 except gen.TimeoutError:
                     self.close()
                     raise gen.Return(False)
+            # 解析消息头，分离头字段和首行（request-line/status-line）
             start_line, headers = self._parse_headers(header_data)
+            # 作为 client 解析的是 server 的 response，作为 server 解析的是 client 的 request。
+            # response 与 request 的 start_line(status-line/request-line) 的字段内容不同：
+            # 1. response's status-line: HTTP-Version SP Status-Code SP Reason-Phrase CRLF
+            # 2. request's request-line：Method SP Request-URI SP HTTP-Version CRLF
+            # start_line 的值是一个 namedtuple。
             if self.is_client:
                 start_line = httputil.parse_response_start_line(start_line)
                 self._response_start_line = start_line
@@ -175,19 +182,23 @@ class HTTP1Connection(httputil.HTTPConnection):
                 self._request_start_line = start_line
                 self._request_headers = headers
 
+            # 非 keep-alive 的请求或响应处理完成后要关闭连接。
             self._disconnect_on_finish = not self._can_keep_alive(
                 start_line, headers)
             need_delegate_close = True
             with _ExceptionLoggingContext(app_log):
                 header_future = delegate.headers_received(start_line, headers)
                 if header_future is not None:
+                    # 如果 header_future 是一个 `Future` 实例，则要等到完成才读取 body。
                     yield header_future
+            # websocket ？？？
             if self.stream is None:
                 # We've been detached.
                 need_delegate_close = False
                 raise gen.Return(False)
             skip_body = False
             if self.is_client:
+                # 作为 client 如果发起的是 HEAD 请求，那么 server response 应该无消息体
                 if (self._request_start_line is not None and
                         self._request_start_line.method == 'HEAD'):
                     skip_body = True
@@ -208,6 +219,13 @@ class HTTP1Connection(httputil.HTTPConnection):
                     # in the case of a 100-continue.  Document or change?
                     yield self._read_message(delegate)
             else:
+                # 100-continue 这个状态码是在 HTTP/1.1 中为了提高传输效率而设置的。当
+                # client 需要 POST 较大数据给 WebServer 时，可以在发送 HTTP 请求时带上
+                # Expect: 100-continue，WebServer 如果接受这个请求则应答一个
+                # ``HTTP/1.1 100 (Continue)``，那么 client 就继续传输 request body，
+                # 否则应答 ``HTTP/1.1 417 Expectation Failed`` client 就放弃传输剩余
+                # 的数据。（注：Expect 头部域，用于指出客户端要求的特殊服务器行为采用扩展语法
+                # 定义，以方便扩展。）
                 if (headers.get("Expect") == "100-continue" and
                         not self._write_finished):
                     self.stream.write(b"HTTP/1.1 100 (Continue)\r\n\r\n")
@@ -228,6 +246,9 @@ class HTTP1Connection(httputil.HTTPConnection):
                             self.stream.close()
                             raise gen.Return(False)
             self._read_finished = True
+            # 对 client mode ，response 解析完成就调用 HTTPMessageDelegate.finish() 方法是合适的；
+            # 对 server mode ，_write_finished 表示 response 是否发送完成，未完成前调用
+            # HTTPMessageDelegate.finish() 方法是合适的；
             if not self._write_finished or self.is_client:
                 need_delegate_close = False
                 with _ExceptionLoggingContext(app_log):
@@ -235,11 +256,17 @@ class HTTP1Connection(httputil.HTTPConnection):
             # If we're waiting for the application to produce an asynchronous
             # response, and we're not detached, register a close callback
             # on the stream (we didn't need one while we were reading)
+            #
+            # NOTE:_finish_future resolves when all data has been written and flushed
+            # to the IOStream.
+            # 等待异步响应完成，所有数据都写入 fd，才继续后续处理，详细见 _finish_request/finish 方法实现。
             if (not self._finish_future.done() and
                     self.stream is not None and
                     not self.stream.closed()):
                 self.stream.set_close_callback(self._on_connection_close)
                 yield self._finish_future
+            # 对于 client mode，处理完响应后如果不是 keep-alive 就断开连接。
+            # 对于 server mode，需要在 response 完成后才断开连接，详细见 _finish_request/finish 方法实现。
             if self.is_client and self._disconnect_on_finish:
                 self.close()
             if self.stream is None:
@@ -250,6 +277,8 @@ class HTTP1Connection(httputil.HTTPConnection):
             self.close()
             raise gen.Return(False)
         finally:
+            # 连接 “关闭” 前还没能结束处理请求（call HTTPMessageDelegate.finish()），则
+            # call  HTTPMessageDelegate.on_connection_close()
             if need_delegate_close:
                 with _ExceptionLoggingContext(app_log):
                     delegate.on_connection_close()
@@ -461,13 +490,29 @@ class HTTP1Connection(httputil.HTTPConnection):
     def _can_keep_alive(self, start_line, headers):
         if self.params.no_keep_alive:
             return False
+        # 在 HTTP/1.0 中没有官方的 keep-alive 操作，HTTP/1.1 所有连接都是默认持
+        # 久化，除非特殊声明不支持。通常是在现有协议上添加一个指数。
+        # client 若支持 keep-alive，会在请求头中添加：Connection: Keep-Alive，
+        # server 响应的时候也要在响应头中增加： Connection: Keep-Alive。参见：
+        # https://zh.wikipedia.org/wiki/HTTP%E6%8C%81%E4%B9%85%E8%BF%9E%E6%8E%A5
         connection_header = headers.get("Connection")
         if connection_header is not None:
             connection_header = connection_header.lower()
+        # 不论是否 is_client mode， start_line 中都包含 version 字段。
+        # ***************************** NOTE ***********************************
+        # 1. 假设使用的是 HTTP/1.0 协议，对 is_client=True，start_line 不包含 method 字段，
+        # 而当 response empty headers(eg.100-continue) 时，start_line.method 会报错。避
+        # 免这种情况只能在 is_client mode 时设置 no_keep_alive=True，自行实现客户端时要注意。
+        # 2. 如果 POST 数据时使用 'Connection: Keep-Alive' 和 'Transfer-Encoding: Chunked',
+        # 这个时候由于没有 'Content-Length' 字段，所以检查不到 keep-alive 而关闭连接。需要增加：
+        # or headers.get("Transfer-Encoding", "").lower() == "chunked"
+        # *************************** NOTE END *********************************
         if start_line.version == "HTTP/1.1":
             return connection_header != "close"
         elif ("Content-Length" in headers
               or start_line.method in ("HEAD", "GET")):
+            # HTTP/1.0 要支持持久化连接需要能够知道 request body 的大小，才能区分
+            # 不同的 HTTP 请求。没有 "Content-Length" 字段，表示没有 request body。
             return connection_header == "keep-alive"
         return False
 
@@ -483,6 +528,16 @@ class HTTP1Connection(httputil.HTTPConnection):
             self._finish_future.set_result(None)
 
     def _parse_headers(self, data):
+        # HTTP 消息包括 Request（c2s）和 Response(s2c)，消息格式为：
+        # 起始行(Request-Line/Status-Line) + 0 个或多个头域(((general-header |
+        # (request-header | response-header) | entity-header)CRLF)) +
+        # 头域结束行(\r\n,CRLF) + 可选的消息体(message-body)，所以读取消息头时以
+        # r"\r\n\r\n" 作为匹配字符。
+        # 每个头域由一个头域名称（name） + 冒号（:） + 域值(value), 三部分组成，
+        # name 是大小写无关的，value 前可以添加任何数量的空格符，头域可以被扩展为
+        # 多行，在每行开始处，使用至少一个空格或制表符。相关 RFC：
+        # 1. Request：http://www.w3.org/Protocols/rfc2616/rfc2616-sec5.html#sec5
+        # 2. Response：http://www.w3.org/Protocols/rfc2616/rfc2616-sec6.html#sec6
         data = native_str(data.decode('latin1'))
         eol = data.find("\r\n")
         start_line = data[:eol]
@@ -513,6 +568,8 @@ class HTTP1Connection(httputil.HTTPConnection):
         else:
             content_length = None
 
+        # 204 No Content，表示服务器已经完成了请求，但是返回的信息不包括 message-body，但是可以通过
+        # header fields 返回一些用于更新的元数据。
         if code == 204:
             # This response code is not allowed to have a non-empty body,
             # and has an implicit length of zero instead of read-until-close.
@@ -523,10 +580,12 @@ class HTTP1Connection(httputil.HTTPConnection):
                     "Response with code %d should not have body" % code)
             content_length = 0
 
+        # 持久连接： Content-Length or Transfer-Encoding
         if content_length is not None:
             return self._read_fixed_body(content_length, delegate)
         if headers.get("Transfer-Encoding") == "chunked":
             return self._read_chunked_body(delegate)
+        # 非持久连接
         if self.is_client:
             return self._read_body_until_close(delegate)
         return None
@@ -544,6 +603,31 @@ class HTTP1Connection(httputil.HTTPConnection):
     @gen.coroutine
     def _read_chunked_body(self, delegate):
         # TODO: "chunk extensions" http://tools.ietf.org/html/rfc2616#section-3.6.1
+        #
+        # *************************** chunk extensions *************************
+        # 使用分块传输编码（chunked transfer encoding）时，消息体由数量未定的块组成，并以最
+        # 后一个大小为 0 的块结束。
+        # 1. 每一个非空的块都以该块包含数据的字节数（十六进制表示）开始，跟随一个 CRLF，然后是数
+        # 据本身，最后跟 CRLF 结束。在一些实现中，块大小和 CRLF 之间填充有白空格（0x20）。
+        # 2. 最后一块由块大小（0），一些可选的填充白空格，以及 CRLF。最后一块不包含任何数据，但
+        # 是可以发送包含消息头字段的可选尾部（注：以下代码实现不支持可选尾部），最后以 CRLF 结尾。
+        # ----------------------------eg. start--------------------------------
+        # HTTP/1.1 200 OK\r\n
+        # Content-Type: text/plain\r\n
+        # Transfer-Encoding: chunked\r\n
+        # \r\n
+        # 25\r\n
+        # This is the data in the first chunk\r\n
+        # 1C\r\n
+        # and this is the second one\r\n
+        # 3\r\n
+        # con\r\n
+        # 8\r\n
+        # sequence\r\n
+        # 0\r\n
+        # \r\n
+        # ----------------------------eg. end--------------------------------
+        # **********************************************************************
         total_size = 0
         while True:
             chunk_len = yield self.stream.read_until(b"\r\n", max_bytes=64)
@@ -563,6 +647,15 @@ class HTTP1Connection(httputil.HTTPConnection):
                         yield gen.maybe_future(delegate.data_received(chunk))
             # chunk ends with \r\n
             crlf = yield self.stream.read_bytes(2)
+            # 如果最后一个 chunk 中包含了可选的尾部，断言会失败。可选尾部由 Trailer 头域支持，
+            # 参考：http://tools.ietf.org/html/rfc2616#section-14.40。
+            # 目前 tornado 中的实现不支持这个可选尾部，如果发生异常的话，可尝试判断是否是 last chunk，
+            # 然后吞掉可选尾部。
+            # eg.
+            # if bytes_to_read == 0 and crlf != b"\r\n":
+            #     yield self.stream.read_until(b"\r\n", max_bytes=self._max_body_size - total_size)
+            # else:
+            #     assert crlf == b"\r\n"
             assert crlf == b"\r\n"
 
     @gen.coroutine
@@ -692,10 +785,11 @@ class HTTP1ServerConnection(object):
                     gen_log.error("Uncaught exception", exc_info=True)
                     conn.close()
                     return
-                # 前面已经处理了所有的异常情况，接下来处理正常情况：若是 keep-alive 的持久连接模式，则继续在该连接上循环
-                # 处理下一个 HTTP 请求直到连接关闭，否则退出循环。
-                # 由 HTTP1Connection._read_message 的实现可知 HTTP1Connection.read_response 返回 False 则
-                # 表示持久连接（keep-alive，连接未关闭），返回 True 则表示非 keep-alive 连接（已关闭）则终止循环。
+                # read_response 方法返回 True 表示此次请求正常处理完成，继续处理下一个请求：
+                #   1. keep-alive 时，等待下一次 read_response 完成；
+                #   2. 非 keep-alive 时，会抛出 StreamClosedError 终止循环；
+                # 返回 False 则表示处理请求时发生了异常无法再继续处理下一个请求，立即终止循环是最优的选择而不是通过下
+                # 一次抛出异常来终止。
                 if not ret:
                     return
                 yield gen.moment

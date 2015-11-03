@@ -174,6 +174,7 @@ class HTTPHeaders(dict):
         >>> h.get('content-type')
         'text/html'
         """
+        # HTTP 请求头可以被扩展为多行，每行开始处使用至少一个空格或者制表符。
         if line[0].isspace():
             # continuation of a multi-line header
             new_part = ' ' + line.lstrip()
@@ -193,6 +194,8 @@ class HTTPHeaders(dict):
         [('Content-Length', '42'), ('Content-Type', 'text/html')]
         """
         h = cls()
+        # str.splitlines() 支持按 universal newlines（Unix:\n, Windows:\r\n, Old Macintosh:\r）
+        # 分割，返回值默认不包括含分隔符，所以能正确处理消息没有头域的情况（headers=r"\r\n"）。
         for line in headers.splitlines():
             if line:
                 h.parse_line(line)
