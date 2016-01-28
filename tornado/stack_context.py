@@ -304,7 +304,7 @@ def wrap(fn):
     asynchronously in the same thread).
 
     wrap(fn) 函数是上下文调度的“核心”，异步调用前用它获取当前上下文快照，再将快照保
-    存在自由变量 cap_contexts中，并返回一个闭包（wrapped 或者 null_wrapper）作为回
+    存在自由变量 cap_contexts 中，并返回一个闭包（wrapped 或者 null_wrapper）作为回
     调函数 fn 的 wrapper，在之后回调时（在其他线程或者在相同线程异步调用）再从
     cap_contexts 中恢复保存的上下文状态，然后执行 fn 函数。
     """

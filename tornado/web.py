@@ -341,6 +341,8 @@ class RequestHandler(object):
         if name in self._headers:
             del self._headers[name]
 
+    # ASCII 0～31 的字符将视为非法的 Header 字符。后面有提到，比如如果允许 `\r\n` 字符，
+    # 便可能导致意外的 Header 注入(按照 Http 协议，Header 之间是以 `\r\n` 分割)。
     _INVALID_HEADER_CHAR_RE = re.compile(br"[\x00-\x1f]")
 
     def _convert_header_value(self, value):
@@ -825,6 +827,8 @@ class RequestHandler(object):
         """
         chunk = b"".join(self._write_buffer)
         self._write_buffer = []
+        # 响应头只会写一次，flush 操作以后再修改的响应头是不会发送到客户端的，但也不会抛异常，
+        # 这个与其他的一些 web framework 抛异常的处理方式不一样。
         if not self._headers_written:
             self._headers_written = True
             for transform in self._transforms:
@@ -842,6 +846,12 @@ class RequestHandler(object):
                 for cookie in self._new_cookie.values():
                     self.add_header("Set-Cookie", cookie.OutputString(None))
 
+            # NOTE：在 Keep-Alive 模式下（`Connection: Keep-Alive`），判断消息边界只能通过
+            # `Content-Length` 或者 `Transfer-Encoding: chunked`，后者仅在 Http/1.1
+            # 提供。若客户端请求是 Http/1.0，在没有指定 `Content-Length` 头域的情况下，按照
+            # 目前实现主动多次调用 `flush(include_footers=False)` 方法写数据，
+            # `write_headers` 中没法支持 chunked，会有问题。看了一下之后的代码，这里已经不依赖
+            # `self.request.version`，`write_headers` 强制启用 Http/1.1。
             start_line = httputil.ResponseStartLine(self.request.version,
                                                     self._status_code,
                                                     self._reason)
@@ -890,9 +900,18 @@ class RequestHandler(object):
             # set on the HTTPConnection (which would otherwise prevent the
             # garbage collection of the RequestHandler when there
             # are keepalive connections)
+            #
+            # NOTE: 这里注释说请求处理完成时将 `HTTPConnection` 的连接关闭回调设置为 None，
+            # 否则长连接情况下当前 `RequestHandler` 实例由于被连接引用而不能被及时垃圾回收。
+            # 这个问题应该是 Tornado v4.0 之前由 `HTTPConnection` 处理 “连接保持”造成的，
+            # 之后的版本由于分离出 `HTTP1ServerConnection` 来处理连接保持已经不存在这个问题：
+            # 每次请求都是单独生成一个 `HTTP1Connection` 实例处理，并且在请求处理完成后会调用
+            # `_clear_callbacks` 方法自动清空回调（参见 `_read_message` 的 finally 块）。
             self.request.connection.set_close_callback(None)
 
         self.flush(include_footers=True)
+        # 按 `HttpServerRequest.finish` 的注释，该方法在 v4.0 已经放弃，而建议直接使用
+        # `request.connection.finish` 方法。
         self.request.finish()
         self._log()
         self._finished = True
@@ -1275,6 +1294,8 @@ class RequestHandler(object):
         before completing the request.  The ``Etag`` header should be set
         (perhaps with `set_etag_header`) before calling this method.
         """
+        # NOTE:``If-Modified-Since`` is compared to the ``Last-Modified`` whereas
+        # ``If-None-Match`` is compared to ``ETag``.
         etag = self._headers.get("Etag")
         inm = utf8(self.request.headers.get("If-None-Match", ""))
         return bool(etag and inm and inm.find(etag) >= 0)
@@ -1334,6 +1355,9 @@ class RequestHandler(object):
                 result = yield result
             if result is not None:
                 raise TypeError("Expected None, got %r" % result)
+            # 就目前版本的实现而言，默认 `self._auto_finish=True`，只有当方法被
+            # `asynchronous` 装饰时才设置为 False，此时 `self.finish()` 将在
+            # 异步方法执行完成后回调。
             if self._auto_finish and not self._finished:
                 self.finish()
         except Exception as e:
@@ -1767,6 +1791,7 @@ class Application(httputil.HTTPServerConnectionDelegate):
                     pass
 
     def start_request(self, connection):
+        # 为了向后兼容，这里的方法签名与HTTPServerConnectionDelegate的不一致???
         # Modern HTTPServer interface
         return _RequestDispatcher(self, connection)
 
@@ -1825,18 +1850,41 @@ class _RequestDispatcher(httputil.HTTPMessageDelegate):
     def headers_received(self, start_line, headers):
         self.set_request(httputil.HTTPServerRequest(
             connection=self.connection, start_line=start_line, headers=headers))
+        # 当前请求处理器若支持 `streaming body` 模式，便直接进入请求处理器的处理阶段，否则便需要
+        # 等待 body 数据接收解析完成后才进入（由 finish 方法中进入）。
         if self.stream_request_body:
             self.request.body = Future()
+            # self.execute() 方法将返回 `handler._prepared_future` 字段，对于 `streaming body` 模式
+            # `handler._prepared_future=Future()`,一旦 futrue 完成就表明 `handler` 已准备好接收 body
+            # 数据。对于非 `streaming body` 模式，没有准备接收 body 数据这个前提，所以 `handler._prepared_future=None`
             return self.execute()
 
     def set_request(self, request):
         self.request = request
         self._find_handler()
+        # 检查目标请求处理器类是否支持 `streaming body`，实际上也就是看看类型是否被
+        # `stream_request_body` 装饰。`stream_request_body` 装饰器由 Tornado v4.0
+        # 开始引入，在之前版本中客户端上传的 body 默认会被解析到 request.arguments 和 request.files
+        # 中。这就预示着在处理文件上传时，文件被整个暂存在内存中，很显然非常不适合较大文件上传。
+        # `streaming body` 模式的引入，可以让使用者去直接处理 raw body 数据，一边接收一
+        # 边写到存储中，减少内存的开销。详细一点说明请参考 `stream_request_body` 装饰器说
+        # 明。
+        # 注：对于文件上传， raw body 是 multipart/form-data 包装的数据，不仅仅包括文件数据。对
+        # raw body 的数据解析，可以参考 httputil.parse_body_arguments/parse_multipart_form_data 方法。
         self.stream_request_body = _has_stream_request_body(self.handler_class)
 
     def _find_handler(self):
         # Identify the handler to use as soon as we have the request.
         # Save url path arguments for later.
+        #
+        # 根据请求的主机和资源路径来定位请求处理器类。
+        # 1. 查找对应主机的所有请求处理器。Tornado 支持虚拟主机，可以为不同的虚拟主机配置不同的请求处理器，
+        #    参见 Application.add_handlers。 不过，一般生产环境都不会直接把 Tornado 进程暴露在请求处
+        #    理最前端，这个功能可以由处理前端来支持，比如 nginx。
+        # 2. 没有为请求的虚拟主机配置处理器时由 `RedirectHandler` 重新定位到默认主机。
+        # 3. 接着根据资源路径来定位具体的请求处理器。如有需要便将 path parameters 解析出来放到 path_kwargs
+        #    或 path_args 字段中。放到哪一个字段取决于资源路径匹配的正则表达式分组是否命名。
+        # 4. 若上一步没有定位到请求处理器，则尝试交由默认的处理器进行处理，否则由 `ErrorHandler` 处理。
         app = self.application
         handlers = app._get_host_handlers(self.request)
         if not handlers:
@@ -1871,6 +1919,7 @@ class _RequestDispatcher(httputil.HTTPMessageDelegate):
 
     def data_received(self, data):
         if self.stream_request_body:
+            # streaming body 模式，由 handler 来自行处理 body stream data
             return self.handler.data_received(data)
         else:
             self.chunks.append(data)
@@ -1911,10 +1960,16 @@ class _RequestDispatcher(httputil.HTTPMessageDelegate):
         # However, that shouldn't happen because _execute has a blanket
         # except handler, and we cannot easily access the IOLoop here to
         # call add_future.
+        #
+        # handler._execute 返回的是一个 Future 对象，但这里不关心 Future 的结果。
+        # 一方面是由于 handler._execute 内部包含在一个异常捕获块中，所以实际上不必担心
+        # 其会抛出异常；另一方面在这里不太方便访问 IOLoop 以调用 add_future 获取结果。
         self.handler._execute(transforms, *self.path_args, **self.path_kwargs)
         # If we are streaming the request body, then execute() is finished
         # when the handler has prepared to receive the body.  If not,
         # it doesn't matter when execute() finishes (so we return None)
+        #
+        # streaming 模式时 handler._prepared_future 将在 handler 准备好接收 body 数据时完成。
         return self.handler._prepared_future
 
 

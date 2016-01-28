@@ -248,7 +248,7 @@ class HTTP1Connection(httputil.HTTPConnection):
             self._read_finished = True
             # 对 client mode ，response 解析完成就调用 HTTPMessageDelegate.finish() 方法是合适的；
             # 对 server mode ，_write_finished 表示 response 是否发送完成，未完成前调用
-            # HTTPMessageDelegate.finish() 方法是合适的；
+            # HTTPMessageDelegate.finish() 方法让 delegate 执行请求响应；
             if not self._write_finished or self.is_client:
                 need_delegate_close = False
                 with _ExceptionLoggingContext(app_log):
@@ -259,7 +259,9 @@ class HTTP1Connection(httputil.HTTPConnection):
             #
             # NOTE:_finish_future resolves when all data has been written and flushed
             # to the IOStream.
-            # 等待异步响应完成，所有数据都写入 fd，才继续后续处理，详细见 _finish_request/finish 方法实现。
+            #
+            # hold 住执行流程，直到异步响应完成，所有数据都写入 fd，才继续后续处理，通常调用方执行 `finish` 方法
+            # 设置 `_finish_future` 完成，详细见 `finish` 和 `_finish_request` 方法实现。
             if (not self._finish_future.done() and
                     self.stream is not None and
                     not self.stream.closed()):
@@ -357,12 +359,14 @@ class HTTP1Connection(httputil.HTTPConnection):
             self._request_start_line = start_line
             # Client requests with a non-empty body must have either a
             # Content-Length or a Transfer-Encoding.
+            # 不检查是否 Http/1.0 是不完备的。
             self._chunking_output = (
                 start_line.method in ('POST', 'PUT', 'PATCH') and
                 'Content-Length' not in headers and
                 'Transfer-Encoding' not in headers)
         else:
             self._response_start_line = start_line
+            # 对于 HTTP/1.0 ``self._chunking_output=False``，不支持分块传输编码。
             self._chunking_output = (
                 # TODO: should this use
                 # self._request_start_line.version or
@@ -378,12 +382,17 @@ class HTTP1Connection(httputil.HTTPConnection):
                 # but if they do, leave it alone.
                 'Transfer-Encoding' not in headers)
             # If a 1.0 client asked for keep-alive, add the header.
+            # HTTP/1.1 默认就是持久化连接，不需要单独指定。
+            # 假设客户端请求使用 HTTP/1.0 和 `Connection:Keep-Alive`，服务端响应时没有指定
+            # `Content-Length` （比如在 handler 中多次调用 flush 方法）,那么响应数据就无法
+            # 判断边界，代码中应该对这个条件做特别处理。
             if (self._request_start_line.version == 'HTTP/1.0' and
                 (self._request_headers.get('Connection', '').lower()
                  == 'keep-alive')):
                 headers['Connection'] = 'Keep-Alive'
         if self._chunking_output:
             headers['Transfer-Encoding'] = 'chunked'
+        # 服务端响应 `HEAD` 或者 304 时不需要 body 数据。
         if (not self.is_client and
             (self._request_start_line.method == 'HEAD' or
              start_line.code == 304)):
@@ -393,6 +402,7 @@ class HTTP1Connection(httputil.HTTPConnection):
         else:
             self._expected_content_remaining = None
         lines = [utf8("%s %s %s" % start_line)]
+        # 通过 add 添加的响应头会输出多个，比如：“Set-Cookie” 响应头。
         lines.extend([utf8(n) + b": " + utf8(v) for n, v in headers.get_all()])
         for line in lines:
             if b'\n' in line:
@@ -402,11 +412,16 @@ class HTTP1Connection(httputil.HTTPConnection):
             future = self._write_future = Future()
             future.set_exception(iostream.StreamClosedError())
         else:
+            # "写回调" 是一个实例字段 `_write_callback`，当上一次写操作还没有回调时就再次执行
+            # 写操作，那么上一次写操作的回调将被放弃（callback is not None）
             if callback is not None:
                 self._write_callback = stack_context.wrap(callback)
             else:
+                # 没有 callback 时，返回 Future(self._write_future)
                 future = self._write_future = Future()
+            # Headers
             data = b"\r\n".join(lines) + b"\r\n\r\n"
+            # message-body
             if chunk:
                 data += self._format_chunk(chunk)
             self._pending_write = self.stream.write(data)
@@ -424,6 +439,8 @@ class HTTP1Connection(httputil.HTTPConnection):
         if self._chunking_output and chunk:
             # Don't write out empty chunks because that means END-OF-STREAM
             # with chunked encoding
+            #
+            # Each chunk: the number of octets of the data(hex number) + CRLF + chunk data + CRLF
             return utf8("%x" % len(chunk)) + b"\r\n" + chunk + b"\r\n"
         else:
             return chunk
@@ -459,6 +476,8 @@ class HTTP1Connection(httputil.HTTPConnection):
                 self._expected_content_remaining)
         if self._chunking_output:
             if not self.stream.closed():
+                # `Transfer-Encoding:chunked`: The terminating chunk is a
+                # regular chunk, with the exception that its length is zero.
                 self._pending_write = self.stream.write(b"0\r\n\r\n")
                 self._pending_write.add_done_callback(self._on_write_complete)
         self._write_finished = True
@@ -471,10 +490,13 @@ class HTTP1Connection(httputil.HTTPConnection):
             self._disconnect_on_finish = True
         # No more data is coming, so instruct TCP to send any remaining
         # data immediately instead of waiting for a full packet or ack.
+        # 关闭 Nagle 算法，效果相当于让 socket 立即 flush 数据到客户端，随后将在
+        # `_finish_request` 中恢复 Nagle 算法。
         self.stream.set_nodelay(True)
         if self._pending_write is None:
             self._finish_request(None)
         else:
+            # 最后一次挂起的写操作完成后回调 `_finish_request` 方法。
             self._pending_write.add_done_callback(self._finish_request)
 
     def _on_write_complete(self, future):
@@ -517,7 +539,9 @@ class HTTP1Connection(httputil.HTTPConnection):
         return False
 
     def _finish_request(self, future):
+        # ``close`` 中还会执行一次，调整到后面执行更好
         self._clear_callbacks()
+        # 服务端不需要支持长连接时，执行关闭操作
         if not self.is_client and self._disconnect_on_finish:
             self.close()
             return

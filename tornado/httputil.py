@@ -72,6 +72,11 @@ class _NormalizedHeaderCache(dict):
     >>> normalized_headers = _NormalizedHeaderCache(10)
     >>> normalized_headers["coNtent-TYPE"]
     'Content-Type'
+
+    Http 头域名称有标准的格式，是一个形如 Http-Header-Case，以 “-” 连接的
+    “首字母大写的单词”组。通常我们可能不会严格按照这个格式去使用，`_NormalizedHeaderCache`
+    就是用字典来缓存标准化头域名称的方案，其中 key 为标准化前的名称，value 为标
+    准化后的名称。就这个使用场景而言，通过字典缓存比每次调用函数转换要高效。
     """
     def __init__(self, size):
         super(_NormalizedHeaderCache, self).__init__()
@@ -86,6 +91,11 @@ class _NormalizedHeaderCache(dict):
             # Limit the size of the cache.  LRU would be better, but this
             # simpler approach should be fine.  In Python 2.7+ we could
             # use OrderedDict (or in 3.2+, @functools.lru_cache).
+            #
+            # OrderedDict 是 python2.7+ collections 库中新增的集合类型，是 dict 的
+            # 子类，能够记录住 key 插入的顺序，修改已插入 key 的 value 值不会改变其之前
+            # 的插入顺序。删除并重新插入 key ，可将其顺序移动到最后。
+            # 这里为了兼容 python2.7- 和 python3+ 才用队列重新实现。
             old_key = self.queue.popleft()
             del self[old_key]
         return normalized
@@ -675,6 +685,11 @@ def parse_body_arguments(content_type, body, arguments, files, headers=None):
     and ``files`` parameters are dictionaries that will be updated
     with the parsed contents.
     """
+    # 只支持解码后（或无编码）的 body 数据。实际上在 Tornado 中有专门的
+    # `_GzipMessageDelegate` 类支持 `gzip` 解码，body 数据都通过其解码后再调用
+    # `parse_body_arguments` 函数。参见 `Http1Connection.read_response` 实现。
+    # `_GzipMessageDelegate` 处理请求后会删除其中的 'Content-Encoding' 头域，用
+    # 'X-Consumed-Content-Encoding' 头域代替。
     if headers and 'Content-Encoding' in headers:
         gen_log.warning("Unsupported Content-Encoding: %s",
                         headers['Content-Encoding'])

@@ -277,6 +277,8 @@ class _ServerRequestAdapter(httputil.HTTPMessageDelegate):
         # 比如 tornado.web.Application 实例，那就委托给它处理请求，否则就自己处理。
         if isinstance(server.request_callback,
                       httputil.HTTPServerConnectionDelegate):
+            # web.Application.start_request 的签名与 HTTPServerConnectionDelegate.start_request
+            # 不一致，缺少 server_conn 参数。这个感觉纯粹是为了兼容 web.Application。
             self.delegate = server.request_callback.start_request(connection)
             self._chunks = None
         else:
