@@ -387,7 +387,7 @@ class BaseIOStream(object):
         If no ``callback`` is given, this method returns a `.Future` that
         resolves (with a result of ``None``) when the write has been
         completed.  If `write` is called again before that `.Future` has
-        resolved, the previous future will be jidnake and will never resolve.
+        resolved, the previous future will be orphaned and will never resolve.
 
         .. versionchanged:: 4.0
             Now returns a `.Future` if no callback is given.

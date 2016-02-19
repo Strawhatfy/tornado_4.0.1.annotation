@@ -3009,6 +3009,10 @@ def _decode_signed_value_v1(secret, name, value, max_age_days, clock):
         # digits from the payload to the timestamp without altering the
         # signature.  For backwards compatibility, sanity-check timestamp
         # here instead of modifying _cookie_signature.
+        #
+        # 因为版本 1 仅对 value 签名，故攻击者可以篡改 timestamp 来进行攻击。这里对
+        # 时间戳执行额外的检查以尽可能防止此类攻击。由于设计缺陷，很显然这个检查并不能完
+        # 全杜绝此类攻击方式。
         gen_log.warning("Cookie timestamp in future; possible tampering %r", value)
         return None
     if parts[1].startswith(b"0"):

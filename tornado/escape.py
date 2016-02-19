@@ -179,6 +179,8 @@ else:
         """
         # This is gross, but python3 doesn't give us another way.
         # Latin1 is the universal donor of character encodings.
+        #
+        # parse_qs 从 python3.2 开始才增加 encoding 和 errors 参数.
         result = _parse_qs(qs, keep_blank_values, strict_parsing,
                            encoding='latin1', errors='strict')
         encoded = {}
